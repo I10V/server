@@ -1,10 +1,21 @@
 # =============================================================================
-# SHINY APP — Архив «Геоморфология» (ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ — ЗУМ ИСПРАВЛЕН)
+# ПРИНУДИТЕЛЬНАЯ НАСТРОЙКА PYTHON (Должна быть в самом верху!)
 # =============================================================================
+# 1. Отключаем авто-управление пакетами
 Sys.setenv(RETICULATE_USE_MANAGED_VENV = "no")
+
+# 2. Указываем путь к конкретному исполняемому файлу
 Sys.setenv(RETICULATE_PYTHON = "C:/Users/user/Documents/.virtualenvs/r-reticulate/Scripts/python.exe")
+
+# 3. Инициализируем мост R-Python
 library(reticulate)
+
+# 4. Блокируем выбор окружения (required = TRUE — это ключ к успеху)
 use_virtualenv("r-reticulate", required = TRUE)
+
+# =============================================================================
+# ЗАГРУЗКА ОСТАЛЬНЫХ БИБЛИОТЕК
+# =============================================================================
 library(shiny)
 library(tidyverse)
 library(stringr)
@@ -15,11 +26,9 @@ library(ragnar)
 library(markdown)
 library(htmltools)
 library(jsonlite)
-
 # Запуск Ollama
 shell("start ollama serve", wait = FALSE)
 Sys.sleep(2)
-
 # ── Инициализация ───────────────────────────────────────────────────────────
 if (!exists("reranker_model")) {
   cross_encoder <- import("sentence_transformers")$CrossEncoder
@@ -28,7 +37,6 @@ if (!exists("reranker_model")) {
 embedder <- embed_ollama(model = "nomic-embed-text")
 db_path <- "D:/Rproc/geomorf_contextual_rag.duckdb"
 clean_llm_dir <- "D:/Rproc/archive/ocr_output/clean_llm/"
-
 # ── Функции (без изменений) ─────────────────────────────────────────────────
 vector_retrieve <- function(query, k = 40, year_filter = "Все", issue_filter = "Все") {
   query_vec <- as.numeric(embedder(query))
@@ -44,7 +52,6 @@ vector_retrieve <- function(query, k = 40, year_filter = "Все", issue_filter 
   dbDisconnect(con)
   res
 }
-
 keyword_retrieve <- function(query, year_filter = "Все", issue_filter = "Все") {
   con <- dbConnect(duckdb(), dbdir = db_path, read_only = TRUE)
   sql <- "SELECT origin, text, 1.0 as similarity FROM chunks WHERE text ILIKE ?"
@@ -55,7 +62,6 @@ keyword_retrieve <- function(query, year_filter = "Все", issue_filter = "Вс
   dbDisconnect(con)
   res
 }
-
 rerank_results <- function(query, candidates_df) {
   if (nrow(candidates_df) == 0) return(candidates_df)
   pairs <- lapply(candidates_df$text, function(txt) list(query, txt))
@@ -63,7 +69,6 @@ rerank_results <- function(query, candidates_df) {
   candidates_df$rerank_score <- as.numeric(scores)
   candidates_df[order(-candidates_df$rerank_score), ]
 }
-
 clean_chunk_preview <- function(text, max_chars = 1000) {
   cleaned <- text %>%
     str_replace_all("(?s)КОНТЕКСТ СТАТЬИ:.*?ТЕКСТ ЧАНКА:", "") %>%
@@ -72,7 +77,6 @@ clean_chunk_preview <- function(text, max_chars = 1000) {
     str_trim()
   str_sub(cleaned, 1, max_chars) %>% str_trim()
 }
-
 # ── UI + CSS (без изменений) ────────────────────────────────────────────────
 ui_css <- "
 .markdown-body { max-width: 900px; margin: 0 auto; font-size: 1.1rem; }
@@ -85,15 +89,12 @@ ui_css <- "
 .highlight-flash-row { animation: flash-row 2s ease-out; }
 @keyframes flash-row { 0% { background-color: #e3f2fd; } 100% { background-color: transparent; } }
 "
-
 ui <- fluidPage(
   theme = bslib::bs_theme(version = 5, bootswatch = "flatly"),
   titlePanel("Цифровой архив журнала «Геоморфология»"),
   tags$style(HTML(ui_css)),
   tabsetPanel(
     id = "tabs",
-    
-    
     tabPanel("🔍 Поиск", sidebarLayout(
       sidebarPanel(class = "sticky-sidebar",
                    textInput("query", "Запрос:", value = "эродированность почв Курской области"),
@@ -104,70 +105,15 @@ ui <- fluidPage(
                    hr(), uiOutput("search_sidebar_list")),
       mainPanel(uiOutput("search_results_cards"))
     )),
-    
-    
     tabPanel("📅 Архив", sidebarLayout(
       sidebarPanel(class = "sticky-sidebar",
                    selectInput("filter_year", "Год:", choices = NULL),
                    selectInput("filter_issue", "Выпуск:", choices = NULL),
                    hr(), uiOutput("archive_sidebar_list")),
       mainPanel(uiOutput("archive_cards"))
-    )),
-    
-    
-    # ── НОВАЯ ВКЛАДКА: LLM Ассистент (автономная) ─────────────────────────────
-    tabPanel(
-      "🤖 LLM Ассистент",
-      fluidPage(
-        tags$style(HTML("
-        #llm_chat { 
-          max-height: 70vh; 
-          overflow-y: auto; 
-          padding: 15px; 
-          background: #f8f9fa; 
-          border-radius: 10px; 
-          border: 1px solid #dee2e6;
-        }
-        .llm-message { margin-bottom: 15px; padding: 12px 18px; border-radius: 18px; max-width: 80%; }
-        .user-msg { background: #0d6efd; color: white; margin-left: auto; border-bottom-right-radius: 4px; }
-        .assistant-msg { background: #e9ecef; color: #212529; margin-right: auto; border-bottom-left-radius: 4px; }
-      ")),
-        
-        h2("🤖 LLM Ассистент по архиву «Геоморфология»", class = "text-center mt-3 mb-4"),
-        p("Автономный ИИ-помощник. Может отвечать по всему архиву, использовать RAG, работать с Ollama и т.д.", 
-          class = "text-center text-muted"),
-        
-        div(id = "llm_chat", 
-            # Сюда будут добавляться сообщения (renderUI)
-            uiOutput("llm_chat_messages")
-        ),
-        
-        br(),
-        
-        fluidRow(
-          column(10, 
-                 textAreaInput("llm_query", NULL, 
-                               placeholder = "Задайте вопрос ассистенту по геоморфологии...",
-                               rows = 3, width = "100%")
-          ),
-          column(2, 
-                 br(),
-                 actionButton("llm_send", "Отправить", 
-                              icon = icon("paper-plane"), 
-                              class = "btn-primary w-100", 
-                              style = "height: 58px;")
-          )
-        ),
-        
-        # Заглушка — сообщение, что вкладка пока не активна
-        uiOutput("llm_status")
-      )
-    )
-
-    
+    ))
   )
 )
-
 # ── Server ──────────────────────────────────────────────────────────────────
 server <- function(input, output, session) {
   
@@ -176,13 +122,13 @@ server <- function(input, output, session) {
     raw <- dbGetQuery(con, "SELECT origin, first(text) as text FROM chunks GROUP BY origin")
     dbDisconnect(con)
     raw %>% mutate(
-      art_id  = paste0("art_", row_number()),
-      title   = str_extract(text, "(?<=Статья: ).+?(?=\\n|$)") %>% str_trim(),
+      art_id = paste0("art_", row_number()),
+      title = str_extract(text, "(?<=Статья: ).+?(?=\\n|$)") %>% str_trim(),
       authors = str_extract(text, "(?<=Авторы: ).+?(?=\\n|$)") %>% str_trim(),
       summary = str_extract(text, "(?<=Краткое содержание: ).+?(?=\\n|$)") %>% str_trim(),
-      source  = str_extract(text, "(?<=Источник: ).+?(?=\\n|$)") %>% str_trim(),
-      year    = str_extract(source, "^\\d{4}"),
-      issue   = str_extract(source, "(?<=\\.)\\d+")
+      source = str_extract(text, "(?<=Источник: ).+?(?=\\n|$)") %>% str_trim(),
+      year = str_extract(source, "^\\d{4}"),
+      issue = str_extract(source, "(?<=\\.)\\d+")
     ) %>% filter(!is.na(title))
   })
   
@@ -329,7 +275,7 @@ server <- function(input, output, session) {
               var searchStr = %s;
               if (!searchStr || searchStr.length < 4) return;
               var cleanSearch = searchStr.replace(/\\s+/g, " ").trim().toLowerCase();
-              
+             
               var elements = container.querySelectorAll("p, li, td, h1, h2, h3, h4, span");
               var target = null;
               for (var i = 0; i < elements.length; i++) {
@@ -353,7 +299,7 @@ server <- function(input, output, session) {
                 target.style.backgroundColor = "#fff3cd";
                 target.style.transition = "background-color 0.5s ease";
                 target.style.borderRadius = "4px";
-                
+               
                 var count = 0;
                 var blink = setInterval(function() {
                   target.style.backgroundColor = (count %% 2 === 0) ? "transparent" : "#fff3cd";
@@ -362,7 +308,7 @@ server <- function(input, output, session) {
                     target.style.backgroundColor = "#fff3cd";
                   }
                 }, 300);
-                
+               
                 setTimeout(function() { target.style.backgroundColor = "transparent"; }, 6000);
               } else {
                 console.log("Текст не найден. Искали:", cleanSearch);
@@ -377,70 +323,5 @@ server <- function(input, output, session) {
       showNotification("Файл статьи не найден на диске", type = "error")
     }
   })
-  
-  
-  # ── LLM АССИСТЕНТ (автономный блок) ───────────────────────────────────────
-  # Всё, что касается LLM, будет здесь. Ничего не трогает другие вкладки.
-  
-  # Хранилище истории чата (реактивный список)
-  llm_history <- reactiveVal(list())
-  
-  # Рендерим сообщения чата
-  output$llm_chat_messages <- renderUI({
-    history <- llm_history()
-    if (length(history) == 0) {
-      return(div(class = "text-center text-muted mt-5",
-                 "Здесь будут появляться сообщения от ассистента.\nПока это заглушка — следующий этап сделаем реальный чат."))
-    }
-    
-    lapply(history, function(msg) {
-      div(class = paste("llm-message", if (msg$role == "user") "user-msg" else "assistant-msg"),
-          strong(if (msg$role == "user") "Вы" else "Ассистент:"),
-          p(msg$content, style = "margin: 0;")
-      )
-    })
-  })
-  
-  # Кнопка "Отправить" — пока заглушка
-  observeEvent(input$llm_send, {
-    req(input$llm_query)
-    
-    # Добавляем сообщение пользователя
-    current <- llm_history()
-    current <- append(current, list(list(role = "user", content = input$llm_query)))
-    llm_history(current)
-    
-    # Очищаем поле ввода
-    updateTextAreaInput(session, "llm_query", value = "")
-    
-    # Показываем "думает..."
-    showNotification("Ассистент думает...", type = "message", duration = 1.5)
-    
-    # === ЗАГЛУШКА ===
-    # На следующем этапе сюда вставим реальный вызов ellmer / ragnar / Ollama
-    Sys.sleep(1.2)  # имитация задержки
-    
-    assistant_reply <- paste0(
-      "✅ Это заглушка LLM-ассистента.\n\n",
-      "Ваш вопрос: «", input$llm_query, "»\n\n",
-      "На следующих этапах здесь будет:\n",
-      "• Полноценный RAG по архиву\n",
-      "• Вызов Ollama (или ellmer)\n",
-      "• История чата сохраняется\n",
-      "• Автономный модуль (если захотим вынести в отдельный файл)"
-    )
-    
-    current <- llm_history()
-    current <- append(current, list(list(role = "assistant", content = assistant_reply)))
-    llm_history(current)
-  })
-  
-  # Статусная строка (можно будет убрать позже)
-  output$llm_status <- renderUI({
-    div(class = "text-center mt-3 text-info small",
-        "Вкладка полностью автономна. Всё, что связано с LLM, находится только в блоке выше.")
-  })
-  
 }
-
 shinyApp(ui = ui, server = server)
