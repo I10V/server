@@ -26,6 +26,58 @@ library(ragnar)
 library(markdown)
 library(htmltools)
 library(jsonlite)
+library(free9api)
+
+# ── НОВАЯ ФУНКЦИЯ LLM-АГЕНТА (RAG + or_chat) ─────────────────────────────────
+# Ключи API (один раз на запуск приложения)
+keys <- readxl::read_xlsx(
+  path = 'D:/Rproc/Pdf parsing/llama keys.xlsx',
+  sheet = 3
+) %>% pull(1)
+
+# Вставь после функции rerank_results (перед # ── Preview + anchor)
+agent_respond <- function(query, history = list(), year_filter = "Все", issue_filter = "Все", k = 8) {
+  # 1. RAG-поиск (используем уже готовые функции)
+  res <- vector_retrieve(query, k = 40, year_filter, issue_filter)
+  
+  if (nrow(res) > 0) {
+    res <- rerank_results(query, res) %>% head(k)
+    context_chunks <- res$text %>% 
+      purrr::map_chr(~ clean_chunk_preview(.x, max_chars = 800)) %>% 
+      paste(collapse = "\n\n---\n\n")
+  } else {
+    context_chunks <- "Нет релевантных документов по запросу в архиве."
+  }
+  
+  # 2. История диалога (для multi-turn)
+  conv_text <- if (length(history) > 0) {
+    paste(sapply(history, function(m) {
+      role_name <- if (m$role == "user") "Пользователь" else "Ассистент"
+      paste0(role_name, ": ", m$content)
+    }), collapse = "\n\n")
+  } else ""
+  
+  # 3. Полный промпт
+  prompt <- paste0(
+    "Ты — специализированный LLM-агент цифрового архива журнала «Геоморфология».\n",
+    "Отвечай ТОЛЬКО на основе предоставленного контекста статей. ",
+    "Если информации недостаточно — честно скажи об этом.\n\n",
+    "Контекст (релевантные чанки):\n", context_chunks, "\n\n",
+    if (nchar(conv_text) > 0) paste0("Предыдущий диалог:\n", conv_text, "\n\n") else "",
+    "Текущий вопрос: ", query, "\n\n",
+    "Ответь подробно, научно и точно на русском языке. ",
+    "Используй Markdown для заголовков, списков и выделения."
+  )
+  
+  # 4. Вызов твоей функции из free9api
+  or_chat(
+    prompt = prompt,
+    keys = keys,
+    model = "stepfun/step-3.5-flash:free",
+    verbose = TRUE
+  )
+}
+
 # Запуск Ollama
 shell("start ollama serve", wait = FALSE)
 Sys.sleep(2)
@@ -62,12 +114,20 @@ keyword_retrieve <- function(query, year_filter = "Все", issue_filter = "Вс
   dbDisconnect(con)
   res
 }
-rerank_results <- function(query, candidates_df) {
-  if (nrow(candidates_df) == 0) return(candidates_df)
-  pairs <- lapply(candidates_df$text, function(txt) list(query, txt))
-  scores <- reranker_model$predict(pairs)
-  candidates_df$rerank_score <- as.numeric(scores)
-  candidates_df[order(-candidates_df$rerank_score), ]
+rerank_results <- function(query, docs) {
+  # Проверка: если документов нет, возвращаем пустой результат
+  if (is.null(docs) || nrow(docs) == 0) return(docs)
+  
+  # Создаем пары для нейросети (запрос + текст каждого чанка)
+  # Используем docs (то, что пришло в функцию), а не candidates_df
+  pairs <- lapply(docs$text, function(txt) list(query, txt))
+  
+  # Вызываем модель (через .GlobalEnv для надежности)
+  scores <- .GlobalEnv$reranker_model$predict(pairs)
+  
+  # Записываем баллы и сортируем
+  docs$rerank_score <- as.numeric(scores)
+  docs[order(-docs$rerank_score), ]
 }
 clean_chunk_preview <- function(text, max_chars = 1000) {
   cleaned <- text %>%
@@ -111,9 +171,33 @@ ui <- fluidPage(
                    selectInput("filter_issue", "Выпуск:", choices = NULL),
                    hr(), uiOutput("archive_sidebar_list")),
       mainPanel(uiOutput("archive_cards"))
-    ))
+    )),
+    
+    
+    # ── НОВАЯ ВКЛАДКА: LLM Ассистент (автономная) ─────────────────────────────
+    tabPanel("🧠 LLM Агент",
+             sidebarLayout(
+               sidebarPanel(
+                 textAreaInput("llm_query", "Ваш вопрос:", 
+                               rows = 3, 
+                               placeholder = "Например: Что известно о лессовых отложениях?"),
+                 fluidRow(
+                   column(6, selectInput("llm_year", "Год:", choices = "Все")),
+                   column(6, selectInput("llm_issue", "Выпуск:", choices = "Все"))
+                 ),
+                 actionButton("llm_send", "Задать вопрос", 
+                              class = "btn-primary w-100", icon = icon("paper-plane"))
+               ),
+               mainPanel(
+                 div(style = "max-height: 75vh; overflow-y: auto; padding: 15px;",
+                     uiOutput("llm_chat_messages"))
+               )
+             )
+    )
   )
 )
+
+
 # ── Server ──────────────────────────────────────────────────────────────────
 server <- function(input, output, session) {
   
@@ -147,30 +231,42 @@ server <- function(input, output, session) {
     updateSelectInput(session, "filter_issue", choices = sort(unique(all_articles()$issue[all_articles()$year == input$filter_year])))
   })
   
-  search_data <- eventReactive(input$search_btn, {
-    req(input$query)
-    if (input$search_type == "sem") {
+# ── ИСПРАВЛЕННЫЙ КУСОК (замени полностью старый search_data) ─────────────────
+search_data <- eventReactive(input$search_btn, {
+  req(input$query)
+  
+  if (input$search_type == "sem") {
+    withProgress(message = "Поиск в архиве...", value = 0, {
+      incProgress(0.3, detail = "Векторный поиск чанков...")
       res <- vector_retrieve(input$query, k = 40, input$search_year, input$search_issue)
-      if (nrow(res) > 0) res <- rerank_results(input$query, res)
-    } else {
-      res <- keyword_retrieve(input$query, input$search_year, input$search_issue)
-    }
-    if (nrow(res) == 0) return(NULL)
-    
-    data <- res %>%
-      left_join(all_articles() %>% select(origin, art_id, title, authors, summary, source), by = "origin") %>%
-      filter(!is.na(title))
-    
-    if (input$search_type == "sem") {
-      data <- data %>% arrange(desc(rerank_score)) %>% slice(1:min(15, n()))
-    } else {
-      data <- data %>%
-        group_by(origin) %>%
-        slice_max(order_by = similarity, n = 1, with_ties = FALSE) %>%
-        ungroup()
-    }
-    data
-  })
+      
+      incProgress(0.7, detail = "Реранкинг результатов...")
+      if (nrow(res) > 0) {
+        res <- rerank_results(input$query, res)
+      }
+      
+      incProgress(1, detail = "Готово")
+    })
+  } else {
+    res <- keyword_retrieve(input$query, input$search_year, input$search_issue)
+  }
+  
+  if (nrow(res) == 0) return(NULL)
+  
+  data <- res %>%
+    left_join(all_articles() %>% select(origin, art_id, title, authors, summary, source), by = "origin") %>%
+    filter(!is.na(title))
+  
+  if (input$search_type == "sem") {
+    data <- data %>% arrange(desc(rerank_score)) %>% slice(1:min(15, n()))
+  } else {
+    data <- data %>%
+      group_by(origin) %>%
+      slice_max(order_by = similarity, n = 1, with_ties = FALSE) %>%
+      ungroup()
+  }
+  data
+})
   
   output$search_sidebar_list <- renderUI({
     data <- search_data()
@@ -250,7 +346,14 @@ server <- function(input, output, session) {
     })
   })
   
-  # ── МОДАЛКА — ТОЧНО ТВОЙ ОРИГИНАЛЬНЫЙ РАБОЧИЙ КОД (sprintf) ─────────────
+  #---------------------------------------------------------- Обычный поиск ------------------------------------------------------------------------------
+  # ── ИСПРАВЛЕННЫЙ КУСОК (замени полностью старый observeEvent для open_article) ─────
+  # Самая надёжная версия на сегодня:
+  # • Для «Точное слово» — глобальная подсветка ВСЕХ вхождений слова через <mark>
+  # • Скролл точно к первому найденному слову
+  # • Никакого закрашивания всей страницы
+  # • Работает даже если текст в сложных тегах
+  
   observeEvent(input$open_article, {
     req(input$open_article)
     parts <- strsplit(input$open_article, "|||", fixed = TRUE)[[1]]
@@ -270,51 +373,76 @@ server <- function(input, output, session) {
           
           tags$script(HTML(sprintf(
             '
-            setTimeout(function() {
-              var container = document.querySelector(".modal-body");
+          console.log("=== MODAL JS ЗАПУЩЕН (финальная версия) ===");
+          setTimeout(function() {
+            $(".modal-body").each(function() {
+              var container = this;
               var searchStr = %s;
-              if (!searchStr || searchStr.length < 4) return;
+              
+              if (!searchStr || searchStr.length < 2) return;
+              
               var cleanSearch = searchStr.replace(/\\s+/g, " ").trim().toLowerCase();
-             
-              var elements = container.querySelectorAll("p, li, td, h1, h2, h3, h4, span");
-              var target = null;
-              for (var i = 0; i < elements.length; i++) {
-                var elText = elements[i].textContent.replace(/\\s+/g, " ").toLowerCase();
-                if (elText.includes(cleanSearch)) {
-                  target = elements[i];
-                  break;
+              var isKeywordSearch = cleanSearch.length < 60;
+              
+              console.log("Запрос:", searchStr, "| Тип:", isKeywordSearch ? "ТОЧНОЕ СЛОВО" : "СЕМАНТИКА");
+              
+              if (isKeywordSearch) {
+                // ── ГЛОБАЛЬНАЯ ПОДСВЕТКА ДЛЯ ОБЫЧНОГО ПОИСКА ──
+                var markdownBody = $(container).find(".markdown-body");
+                if (markdownBody.length === 0) return;
+                
+                var html = markdownBody.html();
+                var escaped = cleanSearch.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&");
+                var regex = new RegExp(escaped, "gi");
+                
+                var newHtml = html.replace(regex, \'<mark style="background-color: #ffeb3b; padding: 2px 4px; border-radius: 3px; box-shadow: 0 0 8px rgba(255,235,59,0.9);">$&</mark>\');
+                
+                markdownBody.html(newHtml);
+                
+                var firstMark = markdownBody.find("mark").first();
+                if (firstMark.length > 0) {
+                  firstMark[0].scrollIntoView({ behavior: "smooth", block: "center" });
+                  console.log("✅ Слово найдено и подсвечено, скролл выполнен");
+                } else {
+                  console.log("❌ Слово НЕ НАЙДЕНО в статье");
                 }
-              }
-              if (!target && cleanSearch.length > 25) {
-                var shortSearch = cleanSearch.substring(0, 25);
-                for (var i = 0; i < elements.length; i++) {
-                  if (elements[i].textContent.toLowerCase().includes(shortSearch)) {
-                    target = elements[i];
-                    break;
-                  }
-                }
-              }
-              if (target) {
-                target.scrollIntoView({ behavior: "smooth", block: "center" });
-                target.style.backgroundColor = "#fff3cd";
-                target.style.transition = "background-color 0.5s ease";
-                target.style.borderRadius = "4px";
-               
-                var count = 0;
-                var blink = setInterval(function() {
-                  target.style.backgroundColor = (count %% 2 === 0) ? "transparent" : "#fff3cd";
-                  if (++count >= 6) {
-                    clearInterval(blink);
-                    target.style.backgroundColor = "#fff3cd";
-                  }
-                }, 300);
-               
-                setTimeout(function() { target.style.backgroundColor = "transparent"; }, 6000);
               } else {
-                console.log("Текст не найден. Искали:", cleanSearch);
+                // ── СТАРАЯ ЛОГИКА ДЛЯ СЕМАНТИЧЕСКОГО ПОИСКА (не трогаем) ──
+                var elements = $(container).find(".markdown-body p, .markdown-body li, .markdown-body td, .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4");
+                var target = null;
+                elements.each(function() {
+                  var elText = $(this).text().replace(/\\s+/g, " ").toLowerCase();
+                  if (elText.includes(cleanSearch)) {
+                    target = this;
+                    return false;
+                  }
+                });
+                if (!target && cleanSearch.length > 25) {
+                  var shortSearch = cleanSearch.substring(0, 25);
+                  elements.each(function() {
+                    if ($(this).text().toLowerCase().includes(shortSearch)) {
+                      target = this;
+                      return false;
+                    }
+                  });
+                }
+                if (target) {
+                  target.scrollIntoView({ behavior: "smooth", block: "center" });
+                  $(target).css({backgroundColor: "#fff3cd", borderRadius: "4px"});
+                  var count = 0;
+                  var blink = setInterval(function() {
+                    $(target).css("background-color", (count %% 2 === 0) ? "transparent" : "#fff3cd");
+                    if (++count >= 6) {
+                      clearInterval(blink);
+                      $(target).css("background-color", "#fff3cd");
+                    }
+                  }, 300);
+                  setTimeout(function() { $(target).css("background-color", "transparent"); }, 6000);
+                }
               }
-            }, 1000);
-            ',
+            });
+          }, 1500);
+          ',
             js_search_str
           )))
         )
@@ -323,5 +451,127 @@ server <- function(input, output, session) {
       showNotification("Файл статьи не найден на диске", type = "error")
     }
   })
+  
+  # ----------------------------------------------------------LLM АССИСТЕНТ--------------------------------------------------
+  llm_history <- reactiveVal(list())
+  
+  # Рендер сообщений чата
+  output$llm_chat_messages <- renderUI({
+    history <- llm_history()
+    if (length(history) == 0) {
+      return(div(class = "text-center text-muted mt-5",
+                 "Задайте вопрос — агент ответит на основе архива журнала «Геоморфология»"))
+    }
+    
+    lapply(history, function(msg) {
+      div(class = paste("llm-message", if (msg$role == "user") "user-msg" else "assistant-msg"),
+          strong(if (msg$role == "user") "Вы" else "Ассистент:"),
+          
+          if (msg$role == "assistant") {
+            tagList(
+              markdown(msg$content %||% ""),
+              
+              # Блок источников — с защитой от ошибок
+              if (!is.null(msg$sources) && length(msg$sources) > 0) {
+                div(class = "mt-3 pt-2 border-top",
+                    h6("Использованные источники:", style = "color: #666; font-size: 0.95rem;"),
+                    tags$ul(style = "padding-left: 20px;",
+                            lapply(seq_along(msg$sources), function(i) {
+                              src <- msg$sources[[i]]
+                              # Защита: если это не список/датафрейм, пропускаем
+                              if (!is.list(src) && !is.data.frame(src)) return(NULL)
+                              
+                              title <- src$title %||% src[["title"]] %||% "Без названия"
+                              encoded <- src$encoded %||% src[["encoded"]] %||% ""
+                              
+                              tags$li(
+                                tags$a(href = "#", 
+                                       onclick = sprintf("Shiny.setInputValue('open_article', '%s', {priority: 'event'})", encoded),
+                                       title)
+                              )
+                            })
+                    )
+                )
+              }
+            )
+          } else {
+            p(msg$content, style = "margin: 0;")
+          }
+      )
+    })
+  })
+  
+  # Кнопка отправки
+  observeEvent(input$llm_send, {
+    req(input$llm_query)
+    
+    user_query <- trimws(input$llm_query)
+    if (user_query == "") return()
+    
+    # Добавляем сообщение пользователя
+    current <- llm_history()
+    current <- append(current, list(list(role = "user", content = user_query)))
+    llm_history(current)
+    
+    updateTextAreaInput(session, "llm_query", value = "")
+    
+    # Прогресс + логика
+    withProgress(message = "Агент думает…", value = 0, {
+      
+      incProgress(0.3, detail = "Поиск релевантных чанков...")
+      
+      raw_results <- vector_retrieve(user_query, k = 40, 
+                                     year_filter = input$llm_year %||% "Все", 
+                                     issue_filter = input$llm_issue %||% "Все")
+      
+      sources_info <- NULL
+      
+      if (nrow(raw_results) > 0) {
+        reranked <- rerank_results(user_query, raw_results) %>% head(8)
+        
+        sources_info <- reranked %>%
+          left_join(all_articles() %>% select(origin, title, authors, source), by = "origin") %>%
+          mutate(
+            title = coalesce(title, str_extract(origin, "[^/]+$"), "Без названия"),
+            clean_anchor = clean_chunk_preview(text, max_chars = 120),
+            encoded = paste0(
+              URLencode(file.path(clean_llm_dir, paste0(source, "_clean_llm.md")), reserved = TRUE),
+              "|||",
+              URLencode(clean_anchor, reserved = TRUE)
+            )
+          ) %>%
+          select(title, encoded) %>%
+          distinct(title, .keep_all = TRUE) %>%
+          as.list() %>%                    # Превращаем в список списков (безопасно)
+          purrr::transpose()
+      }
+      
+      incProgress(0.7, detail = "Генерация ответа...")
+      
+      answer <- agent_respond(
+        query       = user_query,
+        history     = current,
+        year_filter = input$llm_year %||% "Все",
+        issue_filter = input$llm_issue %||% "Все",
+        k = 8
+      )
+      
+      incProgress(1, detail = "Готово")
+    })
+    
+    # Добавляем ответ + источники
+    assistant_msg <- list(
+      role = "assistant",
+      content = answer,
+      sources = sources_info
+    )
+    
+    current <- llm_history()
+    current <- append(current, list(assistant_msg))
+    llm_history(current)
+  })
+  
 }
+
+
 shinyApp(ui = ui, server = server)
