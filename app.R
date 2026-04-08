@@ -1,17 +1,24 @@
-# =============================================================================
-# ПРИНУДИТЕЛЬНАЯ НАСТРОЙКА PYTHON (Должна быть в самом верху!)
-# =============================================================================
-# 1. Отключаем авто-управление пакетами
+# 1. Жесткая зачистка переменных окружения перед стартом
+Sys.unsetenv("RETICULATE_PYTHON")
+Sys.setenv(RETICULATE_PYTHON_FALLBACK = "FALSE")
 Sys.setenv(RETICULATE_USE_MANAGED_VENV = "no")
 
-# 2. Указываем путь к конкретному исполняемому файлу
-Sys.setenv(RETICULATE_PYTHON = "C:/Users/user/Documents/.virtualenvs/r-reticulate/Scripts/python.exe")
+# 2. Нормализация пути (R иногда капризничает из-за регистра букв в Windows)
+py_path <- normalizePath("C:/Users/user/Documents/.virtualenvs/r-reticulate/Scripts/python.exe", winslash = "/", mustWork = FALSE)
 
-# 3. Инициализируем мост R-Python
 library(reticulate)
 
-# 4. Блокируем выбор окружения (required = TRUE — это ключ к успеху)
-use_virtualenv("r-reticulate", required = TRUE)
+# 3. Самый агрессивный способ инициализации
+# Сначала указываем путь, потом СРАЗУ вызываем py_config() для фиксации
+use_python(py_path, required = TRUE)
+
+tryCatch({
+  config <- py_config()
+  message("✅ Python запущен: ", config$python)
+}, error = function(e) {
+  # Если не видит, пробуем через вызов конкретного окружения
+  use_virtualenv("r-reticulate", required = TRUE)
+})
 
 # =============================================================================
 # ЗАГРУЗКА ОСТАЛЬНЫХ БИБЛИОТЕК
@@ -29,6 +36,28 @@ library(jsonlite)
 library(free9api)
 
 # ── НОВАЯ ФУНКЦИЯ LLM-АГЕНТА (RAG + or_chat) ─────────────────────────────────
+rerank_results <- function(query, docs) {
+  if (is.null(docs) || nrow(docs) == 0) return(docs)
+  
+  # Проверяем модель везде: и в глобальном поиске, и просто по имени
+  model_exists <- exists("reranker_model", envir = .GlobalEnv) || exists("reranker_model")
+  
+  if (!model_exists) {
+    message("⚠️ Реранкер не найден, создаю заглушку score")
+    docs$rerank_score <- 0 # Создаем колонку, чтобы arrange не падал
+    return(docs)
+  }
+  
+  # Выбираем объект модели
+  model_obj <- if(exists("reranker_model", envir = .GlobalEnv)) .GlobalEnv$reranker_model else reranker_model
+  
+  pairs <- lapply(docs$text, function(txt) list(query, txt))
+  scores <- model_obj$predict(pairs)
+  
+  docs$rerank_score <- as.numeric(scores)
+  docs[order(-docs$rerank_score), ]
+}
+
 # Ключи API (один раз на запуск приложения)
 keys <- readxl::read_xlsx(
   path = 'D:/Rproc/Pdf parsing/llama keys.xlsx',
@@ -83,8 +112,10 @@ shell("start ollama serve", wait = FALSE)
 Sys.sleep(2)
 # ── Инициализация ───────────────────────────────────────────────────────────
 if (!exists("reranker_model")) {
-  cross_encoder <- import("sentence_transformers")$CrossEncoder
-  reranker_model <- cross_encoder("BAAI/bge-reranker-v2-m3", device = "cpu")
+  message("🚀 Загрузка весов реранкера...")
+  st <- import("sentence_transformers")
+  # Используем <<- чтобы переменная точно улетела в Global Env
+  reranker_model <<- st$CrossEncoder("BAAI/bge-reranker-v2-m3", device = "cpu")
 }
 embedder <- embed_ollama(model = "nomic-embed-text")
 db_path <- "D:/Rproc/geomorf_contextual_rag.duckdb"
@@ -114,21 +145,7 @@ keyword_retrieve <- function(query, year_filter = "Все", issue_filter = "Вс
   dbDisconnect(con)
   res
 }
-rerank_results <- function(query, docs) {
-  # Проверка: если документов нет, возвращаем пустой результат
-  if (is.null(docs) || nrow(docs) == 0) return(docs)
-  
-  # Создаем пары для нейросети (запрос + текст каждого чанка)
-  # Используем docs (то, что пришло в функцию), а не candidates_df
-  pairs <- lapply(docs$text, function(txt) list(query, txt))
-  
-  # Вызываем модель (через .GlobalEnv для надежности)
-  scores <- .GlobalEnv$reranker_model$predict(pairs)
-  
-  # Записываем баллы и сортируем
-  docs$rerank_score <- as.numeric(scores)
-  docs[order(-docs$rerank_score), ]
-}
+
 clean_chunk_preview <- function(text, max_chars = 1000) {
   cleaned <- text %>%
     str_replace_all("(?s)КОНТЕКСТ СТАТЬИ:.*?ТЕКСТ ЧАНКА:", "") %>%
@@ -231,42 +248,42 @@ server <- function(input, output, session) {
     updateSelectInput(session, "filter_issue", choices = sort(unique(all_articles()$issue[all_articles()$year == input$filter_year])))
   })
   
-# ── ИСПРАВЛЕННЫЙ КУСОК (замени полностью старый search_data) ─────────────────
-search_data <- eventReactive(input$search_btn, {
-  req(input$query)
-  
-  if (input$search_type == "sem") {
-    withProgress(message = "Поиск в архиве...", value = 0, {
-      incProgress(0.3, detail = "Векторный поиск чанков...")
-      res <- vector_retrieve(input$query, k = 40, input$search_year, input$search_issue)
-      
-      incProgress(0.7, detail = "Реранкинг результатов...")
-      if (nrow(res) > 0) {
-        res <- rerank_results(input$query, res)
-      }
-      
-      incProgress(1, detail = "Готово")
-    })
-  } else {
-    res <- keyword_retrieve(input$query, input$search_year, input$search_issue)
-  }
-  
-  if (nrow(res) == 0) return(NULL)
-  
-  data <- res %>%
-    left_join(all_articles() %>% select(origin, art_id, title, authors, summary, source), by = "origin") %>%
-    filter(!is.na(title))
-  
-  if (input$search_type == "sem") {
-    data <- data %>% arrange(desc(rerank_score)) %>% slice(1:min(15, n()))
-  } else {
-    data <- data %>%
-      group_by(origin) %>%
-      slice_max(order_by = similarity, n = 1, with_ties = FALSE) %>%
-      ungroup()
-  }
-  data
-})
+  # ── ИСПРАВЛЕННЫЙ КУСОК (замени полностью старый search_data) ─────────────────
+  search_data <- eventReactive(input$search_btn, {
+    req(input$query)
+    
+    if (input$search_type == "sem") {
+      withProgress(message = "Поиск в архиве...", value = 0, {
+        incProgress(0.3, detail = "Векторный поиск чанков...")
+        res <- vector_retrieve(input$query, k = 40, input$search_year, input$search_issue)
+        
+        incProgress(0.7, detail = "Реранкинг результатов...")
+        if (nrow(res) > 0) {
+          res <- rerank_results(input$query, res)
+        }
+        
+        incProgress(1, detail = "Готово")
+      })
+    } else {
+      res <- keyword_retrieve(input$query, input$search_year, input$search_issue)
+    }
+    
+    if (nrow(res) == 0) return(NULL)
+    
+    data <- res %>%
+      left_join(all_articles() %>% select(origin, art_id, title, authors, summary, source), by = "origin") %>%
+      filter(!is.na(title))
+    
+    if (input$search_type == "sem") {
+      data <- data %>% arrange(desc(rerank_score)) %>% slice(1:min(15, n()))
+    } else {
+      data <- data %>%
+        group_by(origin) %>%
+        slice_max(order_by = similarity, n = 1, with_ties = FALSE) %>%
+        ungroup()
+    }
+    data
+  })
   
   output$search_sidebar_list <- renderUI({
     data <- search_data()
