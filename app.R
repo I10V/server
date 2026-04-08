@@ -107,6 +107,22 @@ agent_respond <- function(query, history = list(), year_filter = "Все", issue
   )
 }
 
+
+# Инициализируем морфологию
+morph <- import("pymorphy3")$MorphAnalyzer()
+
+# Твоя функция-помощник
+expand_query <- function(user_query) {
+  words <- unlist(strsplit(user_query, "\\s+"))
+  expanded <- lapply(words, function(w) {
+    p <- morph$parse(w)[[1]]
+    normal_form <- p$normal_form
+    if (w != normal_form) return(c(w, normal_form))
+    return(w)
+  })
+  return(paste(unique(unlist(expanded)), collapse = " "))
+}
+
 # Запуск Ollama
 shell("start ollama serve", wait = FALSE)
 Sys.sleep(2)
@@ -137,14 +153,55 @@ vector_retrieve <- function(query, k = 40, year_filter = "Все", issue_filter 
 }
 keyword_retrieve <- function(query, year_filter = "Все", issue_filter = "Все") {
   con <- dbConnect(duckdb(), dbdir = db_path, read_only = TRUE)
-  sql <- "SELECT origin, text, 1.0 as similarity FROM chunks WHERE text ILIKE ?"
-  params <- list(paste0("%", query, "%"))
-  if (year_filter != "Все") { sql <- paste(sql, "AND regexp_extract(origin, '^\\d{4}') = ?"); params <- c(params, year_filter) }
-  if (issue_filter != "Все") { sql <- paste(sql, "AND regexp_extract(origin, '\\.(\\d+)') = ?"); params <- c(params, issue_filter) }
-  res <- dbGetQuery(con, sql, params)
+  
+  # 1. Разбиваем на слова
+  words <- unlist(strsplit(query, "\\s+"))
+  
+  # 2. Чистим и обрезаем слова для поиска по корню
+  clean_words <- sapply(words, function(w) {
+    w_clean <- tolower(gsub("[[:punct:]]|-", "", w))
+    # Если слово длиннее 7 символов, берем только корень (первые 7)
+    # Это свяжет "дендрохрон", "дендрохронология" и "дендрохронологический"
+    if (nchar(w_clean) > 7) {
+      return(substr(w_clean, 1, 7))
+    } else {
+      return(w_clean)
+    }
+  })
+  
+  clean_words <- clean_words[nchar(clean_words) >= 3]
+  
+  if (length(clean_words) == 0) {
+    dbDisconnect(con)
+    return(data.frame())
+  }
+  
+  # 3. Формируем запрос
+  conditions <- paste0("text_normalized ILIKE '%", clean_words, "%'", collapse = " AND ")
+  
+  sql <- sprintf("
+    SELECT origin, text, 1.0 as similarity 
+    FROM chunks 
+    WHERE %s
+  ", conditions)
+  
+  if (year_filter != "Все") {
+    sql <- paste0(sql, " AND origin LIKE '", year_filter, "%'")
+  }
+  
+  res <- dbGetQuery(con, sql)
   dbDisconnect(con)
-  res
+  
+  # Убираем дубликаты, если они возникли
+  if (nrow(res) > 0) {
+    res <- res %>% distinct(origin, .keep_all = TRUE)
+    res <- res[order(nchar(res$text)), ]
+  }
+  
+  return(head(res, 30))
 }
+
+
 
 clean_chunk_preview <- function(text, max_chars = 1000) {
   cleaned <- text %>%
@@ -210,7 +267,49 @@ ui <- fluidPage(
                      uiOutput("llm_chat_messages"))
                )
              )
+    ),
+    tabPanel("🧬 CAG Синтез",
+             sidebarLayout(
+               sidebarPanel(
+                 class = "sticky-sidebar",
+                 h5("1. Глобальный поиск", class = "text-primary"),
+                 # Объединенное поле поиска
+                 div(style = "display: flex; gap: 5px;",
+                     textInput("cag_query", NULL, placeholder = "Криолитозона, эрозия, Обь...", width = "100%"),
+                     actionButton("cag_search_btn", icon("search"), class = "btn-primary")
+                 ),
+                 hr(),
+                 h5("2. Настройка анализа", class = "text-primary"),
+                 uiOutput("cag_token_counter"),
+                 textAreaInput("cag_llm_query", "Вопрос к выбранным статьям:", 
+                               rows = 5, 
+                               placeholder = "Например: Сведи в таблицу данные по стоку наносов из всех выбранных статей..."),
+                 actionButton("cag_cag_send", "Запустить CAG-анализ", 
+                              class = "btn-success w-100", icon = icon("wand-magic-sparkles")),
+                 hr(),
+                 h5("История обсуждения", class = "text-muted"),
+                 uiOutput("cag_chat_history_summary") # Краткий лог чата
+               ),
+               
+               mainPanel(
+                 # 1. Оборачиваем всё в "раскладушку"
+                 tags$details(
+                   open = TRUE, # Список будет открыт по умолчанию, пока ты его не свернешь
+                   tags$summary(h4("🔍 Список найденных статей (нажми, чтобы скрыть)", style="display:inline; cursor:pointer;")),
+                   
+                   # Твой существующий вывод списка
+                   uiOutput("cag_hybrid_results_ui") 
+                 ),
+                 
+                 hr(),
+                 
+                 # 2. Область ответа ассистента всегда остается под списком
+                 div(id = "cag_response_area",
+                     uiOutput("cag_full_chat_display"))
+               )
+             )
     )
+    
   )
 )
 
@@ -248,42 +347,34 @@ server <- function(input, output, session) {
     updateSelectInput(session, "filter_issue", choices = sort(unique(all_articles()$issue[all_articles()$year == input$filter_year])))
   })
   
-  # ── ИСПРАВЛЕННЫЙ КУСОК (замени полностью старый search_data) ─────────────────
+  # ── Поиск по ключу ─────────────────
+  # ── Поиск по ключу ─────────────────
   search_data <- eventReactive(input$search_btn, {
     req(input$query)
+    raw_q <- trimws(input$query)
+    
+    # Получаем нормальную форму для ИИ поиска
+    lemma_q <- expand_query(raw_q) 
     
     if (input$search_type == "sem") {
-      withProgress(message = "Поиск в архиве...", value = 0, {
-        incProgress(0.3, detail = "Векторный поиск чанков...")
-        res <- vector_retrieve(input$query, k = 40, input$search_year, input$search_issue)
-        
-        incProgress(0.7, detail = "Реранкинг результатов...")
-        if (nrow(res) > 0) {
-          res <- rerank_results(input$query, res)
-        }
-        
-        incProgress(1, detail = "Готово")
-      })
+      combined_q <- paste(raw_q, lemma_q)
+      res <- vector_retrieve(combined_q, k = 50, input$search_year, input$search_issue)
+      if (nrow(res) > 0) res <- rerank_results(raw_q, res)
     } else {
-      res <- keyword_retrieve(input$query, input$search_year, input$search_issue)
+      # ВАЖНО: Сюда передаем raw_q, а не lemma_q!
+      res <- keyword_retrieve(raw_q, input$search_year, input$search_issue)
     }
     
-    if (nrow(res) == 0) return(NULL)
+    if (is.null(res) || nrow(res) == 0) return(NULL)
     
-    data <- res %>%
+    # Соединяем с базой статей
+    res %>%
       left_join(all_articles() %>% select(origin, art_id, title, authors, summary, source), by = "origin") %>%
-      filter(!is.na(title))
-    
-    if (input$search_type == "sem") {
-      data <- data %>% arrange(desc(rerank_score)) %>% slice(1:min(15, n()))
-    } else {
-      data <- data %>%
-        group_by(origin) %>%
-        slice_max(order_by = similarity, n = 1, with_ties = FALSE) %>%
-        ungroup()
-    }
-    data
+      filter(!is.na(title)) %>%
+      { if(input$search_type == "sem") arrange(., desc(rerank_score)) else . } %>%
+      head(15)
   })
+  
   
   output$search_sidebar_list <- renderUI({
     data <- search_data()
@@ -299,23 +390,29 @@ server <- function(input, output, session) {
   output$search_results_cards <- renderUI({
     data <- search_data()
     if (is.null(data)) return(h4("Результатов нет."))
+    
+    # Оригинальное слово для подсветки в режиме ключевых слов
+    raw_q <- trimws(input$query)
+    
     lapply(1:nrow(data), function(i) {
       row <- data[i, ]
       md_file <- file.path(clean_llm_dir, paste0(row$source, "_clean_llm.md"))
       
       if (input$search_type == "sem") {
+        # 1. СЕМАНТИЧЕСКИЙ ПОИСК (оставляем твою логику без изменений)
         full_chunk <- clean_chunk_preview(row$text)
+        
         clean_anchor_text <- full_chunk %>%
           str_replace_all("(?i)(Статья|Авторы|Источник|Краткое содержание):.*", "") %>%
           str_replace_all("[\r\n\t]+", " ") %>%
           str_replace_all("\\s+", " ") %>%
           str_trim()
-        chunk_anchor <- if (nchar(clean_anchor_text) > 40) {
+        
+        target_text <- if (nchar(clean_anchor_text) > 40) {
           str_sub(clean_anchor_text, 15, 95)
         } else {
           str_sub(clean_anchor_text, 1, 80)
         }
-        target_text <- chunk_anchor
         
         card_body <- div(class = "card-body",
                          h5(row$title, style = "color: #2c3e50; font-weight: bold;"),
@@ -323,10 +420,25 @@ server <- function(input, output, session) {
                          p(style = "white-space: pre-wrap; font-size: 0.95rem; color: #0d6efd;", full_chunk),
                          div(class = "text-end", span(class = "badge bg-success", round(row$rerank_score, 3))))
       } else {
-        target_text <- input$query
-        card_body <- div(class = "card-body", h5(row$title), p(class = "text-muted", row$authors))
+        # 2. ПОИСК ПО КЛЮЧУ (вот здесь заменяем логику якоря)
+        # Разбиваем запрос на слова и берем самое длинное (чтобы JS его точно нашел в тексте)
+        words <- unlist(strsplit(raw_q, "\\s+"))
+        valid_words <- words[nchar(words) > 3] # игнорируем мелкие слова
+        
+        if (length(valid_words) > 0) {
+          target_text <- valid_words[which.max(nchar(valid_words))]
+        } else {
+          target_text <- words[1]
+        }
+        
+        card_body <- div(class = "card-body", 
+                         h5(row$title), 
+                         p(class = "text-muted", row$authors),
+                         p(style = "color: #6c757d; font-size: 0.9rem;", 
+                           tags$i("Найдено по ключевому слову")))
       }
       
+      # Кодируем путь и якорь
       encoded <- paste0(URLencode(md_file, reserved = TRUE), "|||", URLencode(target_text, reserved = TRUE))
       
       div(class = "card", id = paste0("search_", row$art_id),
@@ -364,13 +476,6 @@ server <- function(input, output, session) {
   })
   
   #---------------------------------------------------------- Обычный поиск ------------------------------------------------------------------------------
-  # ── ИСПРАВЛЕННЫЙ КУСОК (замени полностью старый observeEvent для open_article) ─────
-  # Самая надёжная версия на сегодня:
-  # • Для «Точное слово» — глобальная подсветка ВСЕХ вхождений слова через <mark>
-  # • Скролл точно к первому найденному слову
-  # • Никакого закрашивания всей страницы
-  # • Работает даже если текст в сложных тегах
-  
   observeEvent(input$open_article, {
     req(input$open_article)
     parts <- strsplit(input$open_article, "|||", fixed = TRUE)[[1]]
@@ -378,6 +483,8 @@ server <- function(input, output, session) {
     chunk_anchor <- if (length(parts) > 1) URLdecode(parts[2]) else ""
     
     if (file.exists(file_path)) {
+      # Передаем не весь текст, а только корень для подсветки
+      # Если это ключевой поиск, берем первые 6-7 символов
       js_search_str <- jsonlite::toJSON(chunk_anchor, auto_unbox = TRUE)
       
       showModal(modalDialog(
@@ -390,82 +497,40 @@ server <- function(input, output, session) {
           
           tags$script(HTML(sprintf(
             '
-          console.log("=== MODAL JS ЗАПУЩЕН (финальная версия) ===");
-          setTimeout(function() {
-            $(".modal-body").each(function() {
-              var container = this;
-              var searchStr = %s;
-              
-              if (!searchStr || searchStr.length < 2) return;
-              
-              var cleanSearch = searchStr.replace(/\\s+/g, " ").trim().toLowerCase();
-              var isKeywordSearch = cleanSearch.length < 60;
-              
-              console.log("Запрос:", searchStr, "| Тип:", isKeywordSearch ? "ТОЧНОЕ СЛОВО" : "СЕМАНТИКА");
-              
-              if (isKeywordSearch) {
-                // ── ГЛОБАЛЬНАЯ ПОДСВЕТКА ДЛЯ ОБЫЧНОГО ПОИСКА ──
+            setTimeout(function() {
+              $(".modal-body").each(function() {
+                var container = this;
+                var searchStr = %s;
+                if (!searchStr || searchStr.length < 2) return;
+
                 var markdownBody = $(container).find(".markdown-body");
-                if (markdownBody.length === 0) return;
-                
                 var html = markdownBody.html();
-                var escaped = cleanSearch.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&");
-                var regex = new RegExp(escaped, "gi");
                 
-                var newHtml = html.replace(regex, \'<mark style="background-color: #ffeb3b; padding: 2px 4px; border-radius: 3px; box-shadow: 0 0 8px rgba(255,235,59,0.9);">$&</mark>\');
+                // 1. Берем КОРЕНЬ слова (первые 6-7 символов)
+                // Это позволит подсветить и "дендрохронология", и "дендро-хронология"
+                var root = searchStr.substring(0, 7).toLowerCase();
                 
+                // 2. Регулярка, которая ищет корень, игнорируя возможные переносы (-) и спецсимволы внутри
+                // [\\\\-\\\\s]* позволяет найти корень, даже если в нем тире или пробел
+                var escapedRoot = root.split("").join("[\\\\-\\\\s]*");
+                var regex = new RegExp("(" + escapedRoot + "[а-яёa-z]*)", "gi");
+                
+                // 3. Подсвечиваем все найденные совпадения
+                var newHtml = html.replace(regex, \'<mark style="background-color: #ffeb3b; color: black; padding: 2px; border-radius: 3px;">$1</mark>\');
                 markdownBody.html(newHtml);
                 
+                // 4. Скроллим к первому найденному
                 var firstMark = markdownBody.find("mark").first();
                 if (firstMark.length > 0) {
                   firstMark[0].scrollIntoView({ behavior: "smooth", block: "center" });
-                  console.log("✅ Слово найдено и подсвечено, скролл выполнен");
-                } else {
-                  console.log("❌ Слово НЕ НАЙДЕНО в статье");
                 }
-              } else {
-                // ── СТАРАЯ ЛОГИКА ДЛЯ СЕМАНТИЧЕСКОГО ПОИСКА (не трогаем) ──
-                var elements = $(container).find(".markdown-body p, .markdown-body li, .markdown-body td, .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4");
-                var target = null;
-                elements.each(function() {
-                  var elText = $(this).text().replace(/\\s+/g, " ").toLowerCase();
-                  if (elText.includes(cleanSearch)) {
-                    target = this;
-                    return false;
-                  }
-                });
-                if (!target && cleanSearch.length > 25) {
-                  var shortSearch = cleanSearch.substring(0, 25);
-                  elements.each(function() {
-                    if ($(this).text().toLowerCase().includes(shortSearch)) {
-                      target = this;
-                      return false;
-                    }
-                  });
-                }
-                if (target) {
-                  target.scrollIntoView({ behavior: "smooth", block: "center" });
-                  $(target).css({backgroundColor: "#fff3cd", borderRadius: "4px"});
-                  var count = 0;
-                  var blink = setInterval(function() {
-                    $(target).css("background-color", (count %% 2 === 0) ? "transparent" : "#fff3cd");
-                    if (++count >= 6) {
-                      clearInterval(blink);
-                      $(target).css("background-color", "#fff3cd");
-                    }
-                  }, 300);
-                  setTimeout(function() { $(target).css("background-color", "transparent"); }, 6000);
-                }
-              }
-            });
-          }, 1500);
-          ',
+              });
+            }, 600);
+            ',
             js_search_str
           )))
         )
       ))
-    } else {
-      showNotification("Файл статьи не найден на диске", type = "error")
     }
   })
   
@@ -588,7 +653,240 @@ server <- function(input, output, session) {
     llm_history(current)
   })
   
+  # -------------CAG -----------------------------------------------------------------------------------------------
+  hybrid_res <- reactiveVal(NULL)      # Результаты поиска статей
+  cag_history <- reactiveVal(list())   # История чата в CAG
+  
+  # ===========================================================================
+  # 1. ГИБРИДНЫЙ ПОИСК (Вкладка CAG)
+  # ===========================================================================
+  
+  observeEvent(input$cag_search_btn, {
+    req(input$cag_query)
+    raw_query <- trimws(input$cag_query)
+    
+    withProgress(message = "Выполняем гибридный поиск...", value = 0, {
+      
+      # --- ШАГ 0: "УМНАЯ" ПРЕДОБРАБОТКА (pymorphy3) ---
+      incProgress(0.1, detail = "Морфологический анализ...")
+      
+      # 1. Используем библиотеку для нормализации падежей
+      # Теперь "дендрохронологией" превращается в "дендрохронология" интеллектуально
+      clean_query <- expand_query(raw_query) 
+      
+      # 2. Дробление для борьбы с "битым" текстом (OCR)
+      expanded_parts <- ""
+      if(nchar(raw_query) > 10) {
+        mid <- floor(nchar(raw_query) / 2)
+        expanded_parts <- paste(substr(raw_query, 1, mid), substr(raw_query, mid + 1, nchar(raw_query)))
+      }
+      
+      # Финальный микс для вектора: Оригинал + Леммы + Половинки
+      search_query <- paste(raw_query, clean_query, expanded_parts)
+      # -----------------------------------------------
+      
+      # А. Семантический поиск
+      incProgress(0.3, detail = "ИИ-поиск и ранжирование...")
+      sem_data <- vector_retrieve(search_query, k = 40)
+      
+      if(!is.null(sem_data) && nrow(sem_data) > 0) {
+        # Реранкер оставляем по оригинальному запросу, чтобы не путать ИИ
+        sem_data <- rerank_results(raw_query, sem_data)
+      }
+      
+      # Б. Поиск по ключевым словам (Тут леммы от pymorphy дают максимум профита)
+      incProgress(0.3, detail = "Поиск по точным совпадениям...")
+      key_data <- keyword_retrieve(clean_query) 
+      
+      # В. Слияние результатов
+      incProgress(0.2, detail = "Слияние потоков...")
+      
+      sem_ids <- if(!is.null(sem_data) && nrow(sem_data) > 0) unique(sem_data$origin) else character(0)
+      key_ids <- if(!is.null(key_data) && nrow(key_data) > 0) unique(key_data$origin) else character(0)
+      all_ids <- unique(c(sem_ids, key_ids))
+      
+      if(length(all_ids) == 0) {
+        hybrid_res(NULL)
+        showNotification("Статьи не найдены", type = "warning")
+        return()
+      }
+      
+      final_df <- all_articles() %>%
+        filter(origin %in% all_ids) %>%
+        mutate(
+          is_semantic = origin %in% sem_ids,
+          is_keyword = origin %in% key_ids
+        ) %>%
+        arrange(desc(is_semantic & is_keyword), desc(is_semantic))
+      
+      hybrid_res(final_df)
+    })
+  })
+  
+  # 2. РЕНДЕР ИНТЕРФЕЙСА РЕЗУЛЬТАТОВ (Исправлено: убран hash_string)
+  output$cag_hybrid_results_ui <- renderUI({
+    data <- hybrid_res()
+    if (is.null(data) || nrow(data) == 0) return(div(class="text-center p-5 text-muted", "Введите запрос..."))
+    
+    tagList(
+      div(class = "list-group shadow-sm",
+          lapply(1:nrow(data), function(i) {
+            item <- data[i, ]
+            safe_id <- paste0("check_", gsub("[^a-zA-Z0-9]", "_", item$origin))
+            
+            div(class = "list-group-item list-group-item-action d-flex align-items-center",
+                style = "border-left: 4px solid #2c3e50; padding: 12px;",
+                checkboxInput(safe_id, label = NULL, value = FALSE, width = "40px"),
+                div(style = "flex-grow: 1;",
+                    div(class = "d-flex justify-content-between align-items-center",
+                        strong(item$title, style="font-size: 1.1rem;"),
+                        div(
+                          # Смысл теперь синий (Primary)
+                          if(item$is_semantic) span(class="badge bg-primary text-white me-1", "Смысл") else NULL,
+                          # Ключ теперь ЗЕЛЕНЫЙ с БЕЛЫМ текстом (как ты просил)
+                          if(item$is_keyword)  span(class="badge bg-success text-white", "Ключ") else NULL
+                        )
+                    ),
+                    div(class="text-muted", style="font-size: 0.85rem;",
+                        paste(item$authors, "|", item$year))
+                )
+            )
+          })
+      )
+    )
+  })
+  
+  # 3. СБОР ВЫБРАННЫХ ID (Исправлено: логика формирования ID совпадает с UI)
+  selected_origins <- reactive({
+    data <- hybrid_res()
+    if (is.null(data)) return(character(0))
+    
+    results <- c()
+    for(i in 1:nrow(data)) {
+      origin_id <- data$origin[i]
+      # Тот же самый gsub, что и в UI
+      safe_id <- paste0("check_", gsub("[^a-zA-Z0-9]", "_", origin_id))
+      
+      if (!is.null(input[[safe_id]]) && input[[safe_id]]) {
+        results <- c(results, origin_id)
+      }
+    }
+    return(results)
+  })
+  
+  # ===========================================================================
+  # 4. СЧЕТЧИК ТОКЕНОВ (Исправлен для DuckDB)
+  # ===========================================================================
+  
+  output$cag_token_counter <- renderUI({
+    origins <- selected_origins()
+    if (length(origins) == 0) return(div(class="alert alert-secondary py-2", "Статьи не выбраны"))
+    
+    con <- dbConnect(duckdb(), dbdir = db_path, read_only = TRUE)
+    # Прямая сборка строки для IN во избежание ошибок VARCHAR[]
+    safe_list <- paste0("'", gsub("'", "''", origins), "'", collapse = ", ")
+    query <- sprintf("SELECT SUM(LENGTH(text)) as total_chars FROM chunks WHERE origin IN (%s)", safe_list)
+    
+    res <- dbGetQuery(con, query)
+    dbDisconnect(con)
+    
+    chars <- res$total_chars
+    if (is.na(chars)) chars <- 0
+    
+    tokens <- round(chars / 3.5) # Эмпирический коэффициент для кириллицы
+    
+    badge_class <- if(tokens < 40000) "bg-success" else if(tokens < 90000) "bg-warning" else "bg-danger"
+    
+    div(class=paste("badge w-100 p-2 mb-2", badge_class),
+        style="font-size: 0.9rem; white-space: normal;",
+        paste("Объем контекста:", format(tokens, big.mark=" "), "токенов"))
+  })
+  
+  # ===========================================================================
+  # 5. CAG ГЕНЕРАЦИЯ (Сбор всех чанков и ответ)
+  # ===========================================================================
+  
+  observeEvent(input$cag_cag_send, {
+    origins <- selected_origins()
+    req(input$cag_llm_query, length(origins) > 0)
+    
+    user_q <- trimws(input$cag_llm_query)
+    # Добавляем в историю вопрос пользователя
+    cag_history(append(cag_history(), list(list(role = "user", content = user_q))))
+    
+    withProgress(message = "Синтезирую ответ по выбранным статьям...", value = 0.2, {
+      
+      # 1. Загрузка всех текстов чанков для выбранных статей
+      con <- dbConnect(duckdb(), dbdir = db_path, read_only = TRUE)
+      safe_list <- paste0("'", gsub("'", "''", origins), "'", collapse = ", ")
+      full_texts <- dbGetQuery(con, sprintf("SELECT origin, text FROM chunks WHERE origin IN (%s)", safe_list))
+      dbDisconnect(con)
+      
+      incProgress(0.3, detail = "Формирую базу знаний...")
+      
+      # 2. Группировка текстов по статьям (XML-разметка для LLM)
+      context_bundle <- full_texts %>%
+        left_join(all_articles() %>% select(origin, title, authors, year), by = "origin") %>%
+        group_by(origin, title, authors, year) %>%
+        summarise(all_text = paste(text, collapse = "\n\n"), .groups = "drop") %>%
+        mutate(formatted = sprintf("<article id='%s' title='%s' year='%s'>\n%s\n</article>", 
+                                   origin, title, year, all_text)) %>%
+        pull(formatted) %>%
+        paste(collapse = "\n\n")
+      
+      # 3. Системный промпт для CAG
+      system_prompt <- paste0(
+        "Ты — профессиональный научный аналитик. Твоя задача — провести глубокий анализ ПОЛНЫХ текстов предоставленных статей.\n",
+        "ПРАВИЛА:\n",
+        "1. Используй ТОЛЬКО предоставленный текст.\n",
+        "2. Цитируй конкретные данные, методы и выводы.\n",
+        "3. Если статьи противоречат друг другу, укажи на это.\n\n",
+        "КОНТЕКСТ СТАТЕЙ:\n", context_bundle
+      )
+      
+      incProgress(0.4, detail = "Нейросеть изучает данные...")
+      
+      # 4. Вызов API
+      answer <- or_chat(
+        prompt = paste(system_prompt, "\n\nВОПРОС ПОЛЬЗОВАТЕЛЯ:", user_q),
+        keys = keys,
+        model = "stepfun/step-3.5-flash:free"
+      )
+      
+      # Сохраняем ответ в историю
+      cag_history(append(cag_history(), list(list(role = "assistant", content = answer))))
+    })
+    
+    # Очищаем поле ввода
+    updateTextAreaInput(session, "cag_llm_query", value = "")
+  })
+  
+  # ===========================================================================
+  # 6. ВЫВОД ЧАТА CAG
+  # ===========================================================================
+  
+  output$cag_full_chat_display <- renderUI({
+    history <- cag_history()
+    if (length(history) == 0) return(NULL)
+    
+    lapply(rev(history), function(msg) { # Выводим последние сообщения сверху
+      if (msg$role == "assistant") {
+        div(class = "card mb-4 shadow border-0",
+            div(class = "card-header bg-dark text-white d-flex justify-content-between",
+                span(icon("microchip"), " Аналитический синтез (Step-3.5-Flash)"),
+                span(class="badge bg-success", "CAG Mode")),
+            div(class = "card-body bg-light", 
+                style = "font-size: 1.05rem; line-height: 1.6;",
+                markdown(msg$content)))
+      } else {
+        div(class = "alert alert-primary shadow-sm mb-2",
+            style = "border-left: 5px solid #0d6efd;",
+            icon("user-circle"), strong(" Ваш запрос: "), msg$content)
+      }
+    })
+  })
 }
+
 
 
 shinyApp(ui = ui, server = server)
